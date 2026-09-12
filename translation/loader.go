@@ -8,7 +8,6 @@ import (
 	"unsafe"
 )
 
-// Debug controls whether verbose loader and VEH logs are printed to stdout
 var Debug bool
 
 var (
@@ -33,7 +32,6 @@ func virtualAlloc(addr uintptr, size uintptr, allocationType uint32, protect uin
 	return ret, nil
 }
 
-// RunMachO parses, maps, patches, and executes an x86_64 Mach-O binary
 func RunMachO(filePath string) error {
 	f, err := macho.Open(filePath)
 	if err != nil {
@@ -47,9 +45,31 @@ func RunMachO(filePath string) error {
 
 	RegisterVEH()
 
-	var entryPoint uintptr
-	var firstSegmentAddr uintptr
-	segmentMemMap := make(map[string]uintptr)
+	var minAddr uint64 = ^uint64(0)
+	var maxAddr uint64 = 0
+
+	for _, load := range f.Loads {
+		seg, ok := load.(*macho.Segment)
+		if !ok || seg.Memsz == 0 {
+			continue
+		}
+		segName := strings.TrimSpace(seg.Name)
+		if segName == "__PAGEZERO" {
+			continue
+		}
+		if seg.Addr < minAddr {
+			minAddr = seg.Addr
+		}
+		if seg.Addr+seg.Memsz > maxAddr {
+			maxAddr = seg.Addr + seg.Memsz
+		}
+	}
+
+	totalSize := uintptr(maxAddr - minAddr)
+	imageBase, err := virtualAlloc(0, totalSize, MEM_RESERVE|MEM_COMMIT, PAGE_EXECUTE_READWRITE)
+	if err != nil {
+		return fmt.Errorf("VirtualAlloc failed for total image span: %w", err)
+	}
 
 	for _, load := range f.Loads {
 		seg, ok := load.(*macho.Segment)
@@ -58,7 +78,6 @@ func RunMachO(filePath string) error {
 		}
 
 		segName := strings.TrimSpace(seg.Name)
-
 		if segName == "__PAGEZERO" {
 			if Debug {
 				fmt.Println("[Darwindows] Skipping __PAGEZERO segment")
@@ -66,19 +85,10 @@ func RunMachO(filePath string) error {
 			continue
 		}
 
+		segDest := imageBase + uintptr(seg.Addr-minAddr)
+
 		if Debug {
-			fmt.Printf("[Darwindows] Mapping segment %s (requested addr: 0x%x, size: 0x%x)\n", segName, seg.Addr, seg.Memsz)
-		}
-
-		mem, err := virtualAlloc(0, uintptr(seg.Memsz), MEM_RESERVE|MEM_COMMIT, PAGE_EXECUTE_READWRITE)
-		if err != nil {
-			return fmt.Errorf("VirtualAlloc failed for segment %s: %w", segName, err)
-		}
-
-		segmentMemMap[segName] = mem
-
-		if firstSegmentAddr == 0 {
-			firstSegmentAddr = mem
+			fmt.Printf("[Darwindows] Mapping segment %s at offset 0x%x (size: 0x%x)\n", segName, seg.Addr-minAddr, seg.Memsz)
 		}
 
 		data, err := seg.Data()
@@ -87,37 +97,45 @@ func RunMachO(filePath string) error {
 		}
 
 		if len(data) > 0 {
-			destSlice := unsafe.Slice((*byte)(unsafe.Pointer(mem)), seg.Memsz)
+			destSlice := unsafe.Slice((*byte)(unsafe.Pointer(segDest)), seg.Memsz)
 			copy(destSlice, data)
 
-			for i := 0; i < len(destSlice)-1; i++ {
+			patchCount := 0
+			for i := 0; i < len(data)-1; i++ {
 				if destSlice[i] == 0x0F && destSlice[i+1] == 0x05 {
 					destSlice[i] = 0xCC   // INT 3
 					destSlice[i+1] = 0x90 // NOP
+					patchCount++
 				}
+			}
+			if Debug {
+				fmt.Printf("[Darwindows] Patched %d syscall instruction(s) in segment %s\n", patchCount, segName)
 			}
 		}
 	}
 
-	if sec := f.Section("__text"); sec != nil {
-		if textSegMem, ok := segmentMemMap["__TEXT"]; ok {
-			if seg := f.Segment("__TEXT"); seg != nil {
-				sectionOffset := sec.Addr - seg.Addr
-				entryPoint = textSegMem + uintptr(sectionOffset)
+	var entryPoint uintptr
+	if f.Symtab != nil {
+		for _, sym := range f.Symtab.Syms {
+			if sym.Name == "_main" {
+				entryPoint = imageBase + uintptr(sym.Value-minAddr)
+				break
 			}
 		}
 	}
 
 	if entryPoint == 0 {
-		if textSegMem, ok := segmentMemMap["__TEXT"]; ok {
-			entryPoint = textSegMem
+		if sec := f.Section("__text"); sec != nil {
+			entryPoint = imageBase + uintptr(sec.Addr-minAddr)
 		} else {
-			entryPoint = firstSegmentAddr
+			entryPoint = imageBase
 		}
 	}
 
 	if Debug {
+		codeBytes := unsafe.Slice((*byte)(unsafe.Pointer(entryPoint)), 64)
 		fmt.Printf("[Darwindows] Executing binary via native thread at entry point: 0x%x\n", entryPoint)
+		fmt.Printf("[Darwindows] First 64 bytes at entry point: %x\n", codeBytes)
 	}
 
 	hThread, _, err := procCreateThread.Call(0, 0, entryPoint, 0, 0, 0)
