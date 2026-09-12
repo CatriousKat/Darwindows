@@ -1,3 +1,6 @@
+# DarWindows Testing Script
+# This script is used for testing DarWindows.
+
 .global _main
 .intel_syntax noprefix
 
