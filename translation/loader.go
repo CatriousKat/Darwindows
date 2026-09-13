@@ -114,6 +114,11 @@ func RunMachO(filePath string) error {
 		}
 	}
 
+	// Parse imports / dylibs for future dynamic linking stubs
+	if f.Symtab != nil && Debug {
+		fmt.Printf("[Darwindows] Loaded symbol table with %d entries\n", len(f.Symtab.Syms))
+	}
+
 	var entryPoint uintptr
 	if f.Symtab != nil {
 		for _, sym := range f.Symtab.Syms {
@@ -133,9 +138,9 @@ func RunMachO(filePath string) error {
 	}
 
 	if Debug {
-		codeBytes := unsafe.Slice((*byte)(unsafe.Pointer(entryPoint)), 64)
+		codeBytes := unsafe.Slice((*byte)(unsafe.Pointer(entryPoint)), 16)
 		fmt.Printf("[Darwindows] Executing binary via native thread at entry point: 0x%x\n", entryPoint)
-		fmt.Printf("[Darwindows] First 64 bytes at entry point: %x\n", codeBytes)
+		fmt.Printf("[Darwindows] First 16 bytes at entry point: %x\n", codeBytes)
 	}
 
 	hThread, _, err := procCreateThread.Call(0, 0, entryPoint, 0, 0, 0)
@@ -144,6 +149,5 @@ func RunMachO(filePath string) error {
 	}
 
 	procWaitForSingleObject.Call(hThread, INFINITE)
-
 	return nil
 }
