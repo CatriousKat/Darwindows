@@ -1,9 +1,12 @@
+# DarWindows GUI/CLI Test
+# This file is required for testing DarWindows' new features.
+
 .global _main
 .intel_syntax noprefix
 
 .data
 title_str:   .asciz "Darwindows macOS Dialog"
-msg_str:     .asciz "Hello from a macOS binary with macOS-styled elements!"
+msg_str:     .asciz "Hello from macOS"
 prompt_title:.asciz "Darwindows Input"
 prompt_msg:  .asciz "Enter text for the textbox test:"
 newline:     .asciz "\n"
