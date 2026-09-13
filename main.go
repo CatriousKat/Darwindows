@@ -1,30 +1,28 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
+
 	"darwindows/translation"
 )
 
 func main() {
-	args := os.Args[1:]
-	var filePath string
+	debugPtr := flag.Bool("debug", false, "Enable verbose debugging and trap logging")
+	flag.Parse()
 
-	for _, arg := range args {
-		if arg == "--debug" {
-			translation.Debug = true
-		} else if filePath == "" {
-			filePath = arg
-		}
-	}
-
-	if filePath == "" {
-		fmt.Println("Usage: darwindows.exe [--debug] <path_to_macho>")
+	args := flag.Args()
+	if len(args) < 1 {
+		fmt.Println("Usage: darwindows.exe <macho_binary> [--debug]")
 		os.Exit(1)
 	}
 
+	translation.Debug = *debugPtr
+	filePath := args[0]
+
 	if err := translation.RunMachO(filePath); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "[Darwindows Error] %v\n", err)
 		os.Exit(1)
 	}
 }
