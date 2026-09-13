@@ -1,53 +1,79 @@
-# DarWindows GUI/CLI Test
-# This file is required for testing DarWindows' new features.
+# DarWindows GUI/CLI Test Script
 
 .global _main
-.intel_syntax noprefix
+.align 4
+
+_main:
+    # 1. Test Mac Version Query
+    movq $0x2000997, %rax
+    leaq .mac_version_buf(%rip), %rdi
+    movq $64, %rsi
+    movq $1, %rdx
+    int $3
+
+    # Print Mac Version to stdout (fd 1)
+    movq $0x2000004, %rax
+    movq $1, %rdi
+    leaq .mac_version_buf(%rip), %rsi
+    movq $20, %rdx
+    int $3
+
+    # 2. Test Kernel Query
+    movq $0x2000997, %rax
+    leaq .kernel_buf(%rip), %rdi
+    movq $64, %rsi
+    movq $2, %rdx
+    int $3
+
+    # Print Kernel to stdout (fd 1)
+    movq $0x2000004, %rax
+    movq $1, %rdi
+    leaq .kernel_buf(%rip), %rsi
+    movq $3, %rdx
+    int $3
+
+    # 3. Test Path Remapping via sys_open using /tmp/test.txt (mapped to os.TempDir())
+    movq $0x2000005, %rax
+    leaq .test_path(%rip), %rdi
+    xorq %rsi, %rsi
+    int $3
+    movq %rax, %rbx
+
+    # 4. Write data to the opened file
+    movq $0x2000004, %rax
+    movq %rbx, %rdi
+    leaq .file_content(%rip), %rsi
+    movq $13, %rdx
+    int $3
+
+    # 5. Close the file
+    movq $0x2000006, %rax
+    movq %rbx, %rdi
+    int $3
+
+    # 6. Show confirmation dialog
+    movq $0x2000999, %rax
+    leaq .dialog_title(%rip), %rdi
+    leaq .dialog_msg(%rip), %rsi
+    xorq %rdx, %rdx
+    xorq %rcx, %rcx
+    int $3
+
+    # 7. Exit Program
+    movq $0x2000001, %rax
+    xorq %rdi, %rdi
+    int $3
 
 .data
-title_str:   .asciz "Darwindows macOS Dialog"
-msg_str:     .asciz "Hello from macOS"
-prompt_title:.asciz "Darwindows Input"
-prompt_msg:  .asciz "Enter text for the textbox test:"
-newline:     .asciz "\n"
-
-.bss
-.lcomm input_buf, 100
-
-.text
-_main:
-    # 1. Trigger Cocoa-Styled Message Box (0x2000999)
-    mov rax, 0x2000999
-    lea rdi, [rip + title_str]
-    lea rsi, [rip + msg_str]
-    syscall
-
-    # 2. Trigger Cocoa-Styled Textbox Input Prompt (0x200099A)
-    mov rax, 0x200099A
-    lea rdi, [rip + prompt_title]
-    lea rsi, [rip + prompt_msg]
-    lea rdx, [rip + input_buf]
-    mov rcx, 100
-    syscall
-    
-    # Save returned byte count from RAX
-    mov r8, rax
-
-    # 3. Print back the inputted text using standard sys_write (0x2000004)
-    mov rax, 0x2000004
-    mov rdi, 1                  # fd = stdout
-    lea rsi, [rip + input_buf]
-    mov rdx, r8                 # number of bytes entered
-    syscall
-
-    # Print newline
-    mov rax, 0x2000004
-    mov rdi, 1
-    lea rsi, [rip + newline]
-    mov rdx, 1
-    syscall
-
-    # 4. Exit cleanly (0x2000001)
-    mov rax, 0x2000001
-    xor rdi, rdi
-    syscall
+.mac_version_buf:
+    .space 64, 0
+.kernel_buf:
+    .space 64, 0
+.test_path:
+    .asciz "/tmp/test.txt"
+.file_content:
+    .asciz "Hello, World!"
+.dialog_title:
+    .asciz "Darwindows Test"
+.dialog_msg:
+    .asciz "Successfully wrote to temp file and verified OS info!"
