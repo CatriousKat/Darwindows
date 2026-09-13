@@ -176,9 +176,11 @@ func vehHandler(pExceptionPointers uintptr) uintptr {
 				*(*uintptr)(unsafe.Pointer(ctxPtr + 248)) = rip
 				return ^uintptr(0)
 
-			case 0x2000005: // sys_open
+			case 0x2000005: // sys_open (with path remapping)
 				pathPtr := rdi
-				path := CStringToString(pathPtr)
+				rawPath := CStringToString(pathPtr)
+				path := RemapPath(rawPath)
+
 				openFile, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0666)
 				if err != nil {
 					rax = uintptr(syscall.ENOENT)
@@ -213,6 +215,36 @@ func vehHandler(pExceptionPointers uintptr) uintptr {
 				*(*uintptr)(unsafe.Pointer(ctxPtr + 248)) = rip
 				return ^uintptr(0)
 
+			case 0x2000997: // Syscall to get Mac Version / Kernel Info
+				outBufPtr := rdi
+				maxLen := rsi
+				infoType := rdx
+
+				var result string
+				if infoType == 2 {
+					result = GetKernel()
+				} else {
+					result = GetMacVersion()
+				}
+
+				if outBufPtr != 0 && maxLen > 0 {
+					destSlice := unsafe.Slice((*byte)(unsafe.Pointer(outBufPtr)), int(maxLen))
+					copyBytes := []byte(result)
+					if len(copyBytes) > int(maxLen)-1 {
+						copyBytes = copyBytes[:int(maxLen)-1]
+					}
+					copy(destSlice, copyBytes)
+					destSlice[len(copyBytes)] = 0
+					rax = uintptr(len(copyBytes))
+				} else {
+					rax = 0
+				}
+
+				rip += 2
+				*(*uintptr)(unsafe.Pointer(ctxPtr + 120)) = rax
+				*(*uintptr)(unsafe.Pointer(ctxPtr + 248)) = rip
+				return ^uintptr(0)
+
 			case 0x2000999, 0x200099A: // Message Box / Input Prompt
 				titlePtr := rdi
 				msgPtr := rsi
@@ -222,8 +254,6 @@ func vehHandler(pExceptionPointers uintptr) uintptr {
 				title := CStringToString(titlePtr)
 				msg := CStringToString(msgPtr)
 				hasInput := (sysNum == 0x200099A)
-
-				println("[DEBUG] Showing dialog:", title, "|", msg)
 
 				dialogMutex.Lock()
 				go showCocoaDialogWindow(title, msg, hasInput)
@@ -316,12 +346,9 @@ func showCocoaDialogWindow(title, prompt string, hasInput bool) {
 		wc.HbrBackground = hBrush
 		wc.HCursor = hCursor
 		wc.LpszClassName = className
-		ret, _, err := procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
+		ret, _, _ := procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
 		if ret != 0 {
 			classRegistered = true
-			println("[DEBUG] RegisterClassExW succeeded, atom:", ret)
-		} else {
-			println("[DEBUG] RegisterClassExW failed:", err.Error())
 		}
 	}
 
@@ -333,7 +360,7 @@ func showCocoaDialogWindow(title, prompt string, hasInput bool) {
 		height = 200
 	}
 
-	hwnd, _, err := procCreateWindowExW.Call(
+	hwnd, _, _ := procCreateWindowExW.Call(
 		0x00000200, // WS_EX_TOOLWINDOW
 		uintptr(unsafe.Pointer(className)),
 		uintptr(unsafe.Pointer(tW)),
@@ -343,7 +370,6 @@ func showCocoaDialogWindow(title, prompt string, hasInput bool) {
 	)
 
 	if hwnd == 0 {
-		println("[DEBUG] CreateWindowExW failed:", err.Error())
 		dialogDone <- struct{}{}
 		return
 	}
