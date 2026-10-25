@@ -14,7 +14,7 @@ func main() {
 
 	args := flag.Args()
 	if len(args) < 1 {
-		fmt.Println("Usage: darwindows.exe <macho_binary> [--debug]")
+		fmt.Println("Usage: darwindows.exe  [--debug] <macho_binary>")
 		os.Exit(1)
 	}
 
