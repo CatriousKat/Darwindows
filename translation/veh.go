@@ -1,292 +1,95 @@
 package translation
 
 import (
-	"os"
-	"runtime"
-	"sync"
+	"fmt"
 	"syscall"
 	"unsafe"
 )
 
-const (
-	EXCEPTION_BREAKPOINT       = 0x80000003
-	EXCEPTION_ACCESS_VIOLATION = 0xc0000005
-	EXCEPTION_CONTINUE_SEARCH  = 0
-	STD_INPUT_HANDLE           = ^uintptr(9)
-	ENABLE_PROCESSED_INPUT     = 0x0001
-	ENABLE_LINE_INPUT          = 0x0002
-	ENABLE_ECHO_INPUT          = 0x0004
-	IDC_ARROW                  = 32512
-)
-
 var (
-	moduser32              = syscall.NewLazyDLL("user32.dll")
-	modgdi32               = syscall.NewLazyDLL("gdi32.dll")
-	procAddVectoredHandler = modkernel32.NewProc("AddVectoredExceptionHandler")
-	procGetStdHandle       = modkernel32.NewProc("GetStdHandle")
-	procReadFile           = modkernel32.NewProc("ReadFile")
-	procGetConsoleMode     = modkernel32.NewProc("GetConsoleMode")
-	procSetConsoleMode     = modkernel32.NewProc("SetConsoleMode")
-	procGetModuleHandleW   = modkernel32.NewProc("GetModuleHandleW")
-	procCreateWindowExW    = moduser32.NewProc("CreateWindowExW")
-	procShowWindow         = moduser32.NewProc("ShowWindow")
-	procUpdateWindow       = moduser32.NewProc("UpdateWindow")
-	procGetMessageW        = moduser32.NewProc("GetMessageW")
-	procTranslateMessage   = moduser32.NewProc("TranslateMessage")
-	procDispatchMessageW   = moduser32.NewProc("DispatchMessageW")
-	procDestroyWindow      = moduser32.NewProc("DestroyWindow")
-	procDefWindowProcW     = moduser32.NewProc("DefWindowProcW")
-	procRegisterClassExW   = moduser32.NewProc("RegisterClassExW")
-	procGetWindowTextW     = moduser32.NewProc("GetWindowTextW")
-	procSetFocus           = moduser32.NewProc("SetFocus")
-	procCreateSolidBrush   = modgdi32.NewProc("CreateSolidBrush")
-	procPostQuitMessage    = moduser32.NewProc("PostQuitMessage")
-	procLoadCursorW        = moduser32.NewProc("LoadCursorW")
-
-	fdMutex sync.Mutex
-	fdMap   = map[uintptr]*os.File{
-		0: os.Stdin,
-		1: os.Stdout,
-		2: os.Stderr,
-	}
-	nextFd uintptr = 3
+	user32DLL, _                       = syscall.LoadDLL("user32.dll")
+	procAddVectoredExceptionHandler, _ = kernel32DLL.FindProc("AddVectoredExceptionHandler")
+	procRemoveVectoredExceptionHandler,_= kernel32DLL.FindProc("RemoveVectoredExceptionHandler")
+	procMessageBoxA, _                 = user32DLL.FindProc("MessageBoxA")
+	procExitProcess, _                 = kernel32DLL.FindProc("ExitProcess")
+	procCreateWindowExA, _             = user32DLL.FindProc("CreateWindowExA")
+	procShowWindow, _                  = user32DLL.FindProc("ShowWindow")
+	procUpdateWindow, _                = user32DLL.FindProc("UpdateWindow")
+	procGetMessageA, _                 = user32DLL.FindProc("GetMessageA")
+	procTranslateMessage, _            = user32DLL.FindProc("TranslateMessage")
+	procDispatchMessageA, _            = user32DLL.FindProc("DispatchMessageA")
+	procPostQuitMessage, _             = user32DLL.FindProc("PostQuitMessage")
+	procRegisterClassA, _              = user32DLL.FindProc("RegisterClassA")
+	procDefWindowProcA, _              = user32DLL.FindProc("DefWindowProcA")
+	procGetWindowTextA, _              = user32DLL.FindProc("GetWindowTextA")
+	procDestroyWindow, _               = user32DLL.FindProc("DestroyWindow")
+	procGetModuleHandleA, _            = kernel32DLL.FindProc("GetModuleHandleA")
 )
+
+const (
+	EXCEPTION_CONTINUE_EXECUTION = ^uintptr(0)
+	EXCEPTION_CONTINUE_SEARCH    = 0
+	STATUS_BREAKPOINT            = 0x80000003
+)
+
+type EXCEPTION_POINTERS struct {
+	ExceptionRecord *EXCEPTION_RECORD
+	ContextRecord   *CONTEXT
+}
 
 type EXCEPTION_RECORD struct {
 	ExceptionCode        uint32
 	ExceptionFlags       uint32
-	ExceptionRecord      uintptr
+	ExceptionRecord      *EXCEPTION_RECORD
 	ExceptionAddress     uintptr
 	NumberParameters     uint32
 	ExceptionInformation [15]uintptr
 }
 
-type EXCEPTION_POINTERS struct {
-	ExceptionRecord uintptr
-	ContextRecord   uintptr
+type CONTEXT struct {
+	P1Home       uint64
+	P2Home       uint64
+	P3Home       uint64
+	P4Home       uint64
+	P5Home       uint64
+	P6Home       uint64
+	ContextFlags uint32
+	MxCsr        uint32
+	SegCs        uint16
+	SegDs        uint16
+	SegEs        uint16
+	SegFs        uint16
+	SegGs        uint16
+	SegSs        uint16
+	EFlags       uint32
+	Dr0          uint64
+	Dr1          uint64
+	Dr2          uint64
+	Dr3          uint64
+	Dr6          uint64
+	Dr7          uint64
+	Rax          uint64
+	Rcx          uint64
+	Rdx          uint64
+	Rbx          uint64
+	Rsp          uint64
+	Rbp          uint64
+	Rsi          uint64
+	Rdi          uint64
+	R8           uint64
+	R9           uint64
+	R10          uint64
+	R11          uint64
+	R12          uint64
+	R13          uint64
+	R14          uint64
+	R15          uint64
+	Rip          uint64
 }
 
-var (
-	inputResultBuffer string
-	dialogHasInput    bool
-	hEditGlobal       uintptr
-	dialogDone        = make(chan struct{})
-	dialogMutex       sync.Mutex
-	classRegistered   bool
-)
-
-func vehHandler(pExceptionPointers uintptr) uintptr {
-	if pExceptionPointers == 0 {
-		return EXCEPTION_CONTINUE_SEARCH
-	}
-
-	pEp := (*EXCEPTION_POINTERS)(unsafe.Pointer(pExceptionPointers))
-	if pEp.ExceptionRecord == 0 {
-		return EXCEPTION_CONTINUE_SEARCH
-	}
-
-	pRec := (*EXCEPTION_RECORD)(unsafe.Pointer(pEp.ExceptionRecord))
-	ctxPtr := pEp.ContextRecord
-
-	if pRec.ExceptionCode == EXCEPTION_ACCESS_VIOLATION {
-		return EXCEPTION_CONTINUE_SEARCH
-	}
-
-	if pRec.ExceptionCode == EXCEPTION_BREAKPOINT {
-		if ctxPtr != 0 {
-			rax := *(*uintptr)(unsafe.Pointer(ctxPtr + 120))
-			rcx := *(*uintptr)(unsafe.Pointer(ctxPtr + 128))
-			rdx := *(*uintptr)(unsafe.Pointer(ctxPtr + 136))
-			rsi := *(*uintptr)(unsafe.Pointer(ctxPtr + 168))
-			rdi := *(*uintptr)(unsafe.Pointer(ctxPtr + 176))
-			rip := *(*uintptr)(unsafe.Pointer(ctxPtr + 248))
-
-			sysNum := rax
-
-			switch sysNum {
-			case 0x2000001: // sys_exit
-				os.Exit(int(rdi))
-
-			case 0x2000003: // sys_read
-				fd := rdi
-				buf := rsi
-				count := rdx
-
-				if fd == 0 {
-					hStdin, _, _ := procGetStdHandle.Call(STD_INPUT_HANDLE)
-					var mode uint32
-					procGetConsoleMode.Call(hStdin, uintptr(unsafe.Pointer(&mode)))
-					procSetConsoleMode.Call(hStdin, uintptr(mode|ENABLE_PROCESSED_INPUT|ENABLE_LINE_INPUT|ENABLE_ECHO_INPUT))
-
-					var bytesRead uint32
-					data := unsafe.Slice((*byte)(unsafe.Pointer(buf)), int(count))
-					ret, _, _ := procReadFile.Call(hStdin, uintptr(unsafe.Pointer(&data[0])), uintptr(count), uintptr(unsafe.Pointer(&bytesRead)), 0)
-					if ret == 0 {
-						rax = 0
-					} else {
-						rax = uintptr(bytesRead)
-					}
-				} else {
-					fdMutex.Lock()
-					f, exists := fdMap[fd]
-					fdMutex.Unlock()
-
-					if !exists {
-						rax = uintptr(syscall.EBADF)
-					} else {
-						data := unsafe.Slice((*byte)(unsafe.Pointer(buf)), int(count))
-						n, err := f.Read(data)
-						if err != nil && n == 0 {
-							rax = 0
-						} else {
-							rax = uintptr(n)
-						}
-					}
-				}
-
-				rip += 2
-				*(*uintptr)(unsafe.Pointer(ctxPtr + 120)) = rax
-				*(*uintptr)(unsafe.Pointer(ctxPtr + 248)) = rip
-				return ^uintptr(0)
-
-			case 0x2000004: // sys_write
-				fd := rdi
-				buf := rsi
-				count := rdx
-
-				fdMutex.Lock()
-				f, exists := fdMap[fd]
-				fdMutex.Unlock()
-
-				if !exists {
-					rax = uintptr(syscall.EBADF)
-				} else {
-					data := unsafe.Slice((*byte)(unsafe.Pointer(buf)), int(count))
-					n, err := f.Write(data)
-					if err == nil {
-						f.Sync()
-						rax = uintptr(n)
-					} else {
-						rax = 0
-					}
-				}
-
-				rip += 2
-				*(*uintptr)(unsafe.Pointer(ctxPtr + 120)) = rax
-				*(*uintptr)(unsafe.Pointer(ctxPtr + 248)) = rip
-				return ^uintptr(0)
-
-			case 0x2000005: // sys_open (with path remapping)
-				pathPtr := rdi
-				rawPath := CStringToString(pathPtr)
-				path := RemapPath(rawPath)
-
-				openFile, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0666)
-				if err != nil {
-					rax = uintptr(syscall.ENOENT)
-				} else {
-					fdMutex.Lock()
-					newFd := nextFd
-					nextFd++
-					fdMap[newFd] = openFile
-					fdMutex.Unlock()
-					rax = newFd
-				}
-
-				rip += 2
-				*(*uintptr)(unsafe.Pointer(ctxPtr + 120)) = rax
-				*(*uintptr)(unsafe.Pointer(ctxPtr + 248)) = rip
-				return ^uintptr(0)
-
-			case 0x2000006: // sys_close
-				fd := rdi
-				fdMutex.Lock()
-				if f, exists := fdMap[fd]; exists && fd > 2 {
-					f.Close()
-					delete(fdMap, fd)
-					rax = 0
-				} else {
-					rax = uintptr(syscall.EBADF)
-				}
-				fdMutex.Unlock()
-
-				rip += 2
-				*(*uintptr)(unsafe.Pointer(ctxPtr + 120)) = rax
-				*(*uintptr)(unsafe.Pointer(ctxPtr + 248)) = rip
-				return ^uintptr(0)
-
-			case 0x2000997: // Syscall to get Mac Version / Kernel Info
-				outBufPtr := rdi
-				maxLen := rsi
-				infoType := rdx
-
-				var result string
-				if infoType == 2 {
-					result = GetKernel()
-				} else {
-					result = GetMacVersion()
-				}
-
-				if outBufPtr != 0 && maxLen > 0 {
-					destSlice := unsafe.Slice((*byte)(unsafe.Pointer(outBufPtr)), int(maxLen))
-					copyBytes := []byte(result)
-					if len(copyBytes) > int(maxLen)-1 {
-						copyBytes = copyBytes[:int(maxLen)-1]
-					}
-					copy(destSlice, copyBytes)
-					destSlice[len(copyBytes)] = 0
-					rax = uintptr(len(copyBytes))
-				} else {
-					rax = 0
-				}
-
-				rip += 2
-				*(*uintptr)(unsafe.Pointer(ctxPtr + 120)) = rax
-				*(*uintptr)(unsafe.Pointer(ctxPtr + 248)) = rip
-				return ^uintptr(0)
-
-			case 0x2000999, 0x200099A: // Message Box / Input Prompt
-				titlePtr := rdi
-				msgPtr := rsi
-				outBufPtr := rdx
-				maxLen := rcx
-
-				title := CStringToString(titlePtr)
-				msg := CStringToString(msgPtr)
-				hasInput := (sysNum == 0x200099A)
-
-				dialogMutex.Lock()
-				go showCocoaDialogWindow(title, msg, hasInput)
-				<-dialogDone
-				resultText := inputResultBuffer
-				dialogMutex.Unlock()
-
-				if hasInput && outBufPtr != 0 && maxLen > 0 {
-					destSlice := unsafe.Slice((*byte)(unsafe.Pointer(outBufPtr)), int(maxLen))
-					copyBytes := []byte(resultText)
-					if len(copyBytes) > int(maxLen)-1 {
-						copyBytes = copyBytes[:int(maxLen)-1]
-					}
-					copy(destSlice, copyBytes)
-					destSlice[len(copyBytes)] = 0
-					rax = uintptr(len(copyBytes))
-				} else {
-					rax = 0
-				}
-
-				rip += 2
-				*(*uintptr)(unsafe.Pointer(ctxPtr + 120)) = rax
-				*(*uintptr)(unsafe.Pointer(ctxPtr + 248)) = rip
-				return ^uintptr(0)
-			}
-		}
-	}
-	return EXCEPTION_CONTINUE_SEARCH
-}
-
-type WNDCLASSEX struct {
-	CbSize        uint32
+type WNDCLASSA struct {
 	Style         uint32
+	_             [4]byte
 	LpfnWndProc   uintptr
 	CbClsExtra    int32
 	CbWndExtra    int32
@@ -294,124 +97,112 @@ type WNDCLASSEX struct {
 	HIcon         uintptr
 	HCursor       uintptr
 	HbrBackground uintptr
-	LpszMenuName  *uint16
-	LpszClassName *uint16
-	HIconSm       uintptr
+	LpszMenuName  *byte
+	LpszClassName *byte
 }
 
-func cocoaWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
-	const WM_COMMAND = 0x0111
-	const WM_CLOSE = 0x0010
-	const BN_CLICKED = 0
+var vehHandle uintptr
 
-	if msg == WM_COMMAND {
-		code := uint32(wParam >> 16)
-		id := uint16(wParam & 0xFFFF)
-		if id == 1 && code == BN_CLICKED {
-			if dialogHasInput && hEditGlobal != 0 {
-				var buf [256]uint16
-				procGetWindowTextW.Call(hEditGlobal, uintptr(unsafe.Pointer(&buf[0])), 256)
-				inputResultBuffer = syscall.UTF16ToString(buf[:])
+func readCString(addr uintptr) string {
+	if addr == 0 {
+		return ""
+	}
+	var buf []byte
+	for i := uintptr(0); i < 4096; i++ {
+		b := *(*byte)(unsafe.Pointer(addr + i))
+		if b == 0 {
+			break
+		}
+		buf = append(buf, b)
+	}
+	return string(buf)
+}
+
+var (
+	inputResult     string
+	hEditCtrl       uintptr
+	classRegistered bool
+)
+
+func inputDlgWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
+	switch msg {
+	case 0x0111: // WM_COMMAND
+		if LOWORD(uint32(wParam)) == 1 { // OK button ID
+			var buf [256]byte
+			ret, _, _ := procGetWindowTextA.Call(hEditCtrl, uintptr(unsafe.Pointer(&buf[0])), 256)
+			if ret > 0 {
+				inputResult = string(buf[:ret])
+			} else {
+				inputResult = ""
 			}
 			procDestroyWindow.Call(hwnd)
-			procPostQuitMessage.Call(0)
+			return 0
 		}
-	} else if msg == WM_CLOSE {
-		procDestroyWindow.Call(hwnd)
+	case 0x0002: // WM_DESTROY
 		procPostQuitMessage.Call(0)
-	} else {
-		ret, _, _ := procDefWindowProcW.Call(hwnd, uintptr(msg), wParam, lParam)
-		return ret
+		return 0
 	}
-	return 0
+	ret, _, _ := procDefWindowProcA.Call(hwnd, uintptr(msg), wParam, lParam)
+	return ret
 }
 
-func showCocoaDialogWindow(title, prompt string, hasInput bool) {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+func LOWORD(val uint32) uint16 {
+	return uint16(val & 0xFFFF)
+}
 
-	inputResultBuffer = ""
-	dialogHasInput = hasInput
-	className, _ := syscall.UTF16PtrFromString("DarwindowsCocoaSystemDialog")
-
-	hInst, _, _ := procGetModuleHandleW.Call(0)
-	hBrush, _, _ := procCreateSolidBrush.Call(uintptr(245 | (245 << 8) | (247 << 16)))
-	hCursor, _, _ := procLoadCursorW.Call(0, IDC_ARROW)
+func showGUIInputBox(title, prompt string) string {
+	inputResult = ""
+	className, _ := syscall.BytePtrFromString("DarwindowsWin32InputBox")
+	hInst, _, _ := procGetModuleHandleA.Call(0)
 
 	if !classRegistered {
-		var wc WNDCLASSEX
-		wc.CbSize = uint32(unsafe.Sizeof(wc))
-		wc.LpfnWndProc = syscall.NewCallback(cocoaWndProc)
-		wc.HInstance = hInst
-		wc.HbrBackground = hBrush
-		wc.HCursor = hCursor
-		wc.LpszClassName = className
-		ret, _, _ := procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
-		if ret != 0 {
-			classRegistered = true
+		wndClass := WNDCLASSA{
+			Style:         0,
+			LpfnWndProc:   syscall.NewCallback(inputDlgWndProc),
+			CbClsExtra:    0,
+			CbWndExtra:    0,
+			HInstance:     hInst,
+			HCursor:       0,
+			HbrBackground: 15, // COLOR_WINDOW + 1
+			LpszClassName: className,
 		}
+		procRegisterClassA.Call(uintptr(unsafe.Pointer(&wndClass)))
+		classRegistered = true
 	}
 
-	tW, _ := syscall.UTF16PtrFromString(title)
-	pW, _ := syscall.UTF16PtrFromString(prompt)
-
-	height := uintptr(160)
-	if hasInput {
-		height = 200
-	}
-
-	hwnd, _, _ := procCreateWindowExW.Call(
-		0x00000200, // WS_EX_TOOLWINDOW
+	pTitle, _ := syscall.BytePtrFromString(title)
+	hwnd, _, _ := procCreateWindowExA.Call(
+		0x00000100, // WS_EX_DLGMODALFRAME
 		uintptr(unsafe.Pointer(className)),
-		uintptr(unsafe.Pointer(tW)),
-		0x90CA0000, // WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE
-		500, 350, 400, height,
+		uintptr(unsafe.Pointer(pTitle)),
+		0x94CA0000, // WS_VISIBLE | WS_POPUP | WS_CAPTION | WS_SYSMENU
+		400, 300, 360, 150,
 		0, 0, hInst, 0,
 	)
 
 	if hwnd == 0 {
-		dialogDone <- struct{}{}
-		return
+		return ""
 	}
 
-	classNameStatic, _ := syscall.UTF16PtrFromString("STATIC")
-	procCreateWindowExW.Call(
-		0, uintptr(unsafe.Pointer(classNameStatic)), uintptr(unsafe.Pointer(pW)),
-		0x50020000, // WS_CHILD | WS_VISIBLE | SS_LEFT
-		25, 25, 340, 40,
-		hwnd, 0, hInst, 0,
-	)
+	// Create Static Prompt Label
+	pPrompt, _ := syscall.BytePtrFromString(prompt)
+	clsStatic, _ := syscall.BytePtrFromString("STATIC")
+	procCreateWindowExA.Call(0, uintptr(unsafe.Pointer(clsStatic)), uintptr(unsafe.Pointer(pPrompt)), 0x50000000, 20, 15, 300, 20, hwnd, 0, hInst, 0)
 
-	if hasInput {
-		classNameEdit, _ := syscall.UTF16PtrFromString("EDIT")
-		emptyStr, _ := syscall.UTF16PtrFromString("")
-		hEditGlobal, _, _ = procCreateWindowExW.Call(
-			0x00000200, // WS_EX_CLIENTEDGE
-			uintptr(unsafe.Pointer(classNameEdit)), uintptr(unsafe.Pointer(emptyStr)),
-			0x50810080, // WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL
-			25, 75, 335, 28,
-			hwnd, 0, hInst, 0,
-		)
-		procSetFocus.Call(hEditGlobal)
-	}
+	// Create Edit Control (Input Text Box)
+	clsEdit, _ := syscall.BytePtrFromString("EDIT")
+	hEdit, _, _ := procCreateWindowExA.Call(0x00000200, uintptr(unsafe.Pointer(clsEdit)), 0, 0x50010080, 20, 45, 300, 25, hwnd, 101, hInst, 0)
+	hEditCtrl = hEdit
 
-	classNameButton, _ := syscall.UTF16PtrFromString("BUTTON")
-	btnText, _ := syscall.UTF16PtrFromString("OK")
-	btnY := uintptr(85)
-	if hasInput {
-		btnY = 120
-	}
+	// Create OK Button
+	clsButton, _ := syscall.BytePtrFromString("BUTTON")
+	btnOK, _ := syscall.BytePtrFromString("OK")
+	procCreateWindowExA.Call(0, uintptr(unsafe.Pointer(clsButton)), uintptr(unsafe.Pointer(btnOK)), 0x50010000, 230, 80, 90, 30, hwnd, 1, hInst, 0)
 
-	procCreateWindowExW.Call(
-		0, uintptr(unsafe.Pointer(classNameButton)), uintptr(unsafe.Pointer(btnText)),
-		0x50010001, // WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON
-		260, btnY, 100, 32,
-		hwnd, 1, hInst, 0,
-	)
-
-	procShowWindow.Call(hwnd, 5)
+	procShowWindow.Call(hwnd, 5) // SW_SHOW
 	procUpdateWindow.Call(hwnd)
 
+	// Win32 Message Loop
 	var msg struct {
 		Hwnd    uintptr
 		Message uint32
@@ -420,37 +211,126 @@ func showCocoaDialogWindow(title, prompt string, hasInput bool) {
 		Time    uint32
 		Pt      struct{ X, Y int32 }
 	}
-
 	for {
-		ret, _, _ := procGetMessageW.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0)
-		if int32(ret) <= 0 {
+		ret, _, _ := procGetMessageA.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0)
+		if ret == 0 || ret == ^uintptr(0) {
 			break
 		}
 		procTranslateMessage.Call(uintptr(unsafe.Pointer(&msg)))
-		procDispatchMessageW.Call(uintptr(unsafe.Pointer(&msg)))
+		procDispatchMessageA.Call(uintptr(unsafe.Pointer(&msg)))
 	}
 
-	dialogDone <- struct{}{}
+	return inputResult
 }
 
-func CStringToString(ptr uintptr) string {
-	if ptr == 0 {
-		return ""
-	}
-	var bytes []byte
-	for i := uintptr(0); ; i++ {
-		b := *(*byte)(unsafe.Pointer(ptr + i))
-		if b == 0 {
-			break
+func vehCallback(pExceptionInfo *EXCEPTIONS_POINTERS_ALIAS) uintptr {
+	info := (*EXCEPTION_POINTERS)(unsafe.Pointer(pExceptionInfo))
+
+	if info.ExceptionRecord.ExceptionCode == STATUS_BREAKPOINT {
+		rip := info.ContextRecord.Rip
+		rax := info.ContextRecord.Rax
+
+		if Debug {
+			fmt.Printf("[Darwindows VEH] Caught breakpoint trap at RIP: 0x%x, RAX: 0x%x\n", rip, rax)
 		}
-		bytes = append(bytes, b)
+
+		switch rax {
+		case 0x2000997: // Get macOS version info
+			bufPtr := info.ContextRecord.Rcx
+			maxLen := info.ContextRecord.Rdx
+
+			osStr := "macOS 10.15 Catalina"
+			if maxLen > 0 {
+				destSlice := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(bufPtr))), maxLen)
+				n := copy(destSlice, []byte(osStr+"\x00"))
+				info.ContextRecord.Rax = uint64(n)
+			} else {
+				info.ContextRecord.Rax = 0
+			}
+			info.ContextRecord.Rip += 1
+			return EXCEPTION_CONTINUE_EXECUTION
+
+		case 0x2000999: // Message Box
+			titlePtr := info.ContextRecord.Rdi
+			msgPtr := info.ContextRecord.Rsi
+
+			title := readCString(uintptr(titlePtr))
+			msg := readCString(uintptr(msgPtr))
+
+			if Debug {
+				fmt.Printf("[Darwindows GUI] MessageBox -> Title: %q, Msg: %q\n", title, msg)
+			}
+
+			pTitle, _ := syscall.BytePtrFromString(title)
+			pMsg, _ := syscall.BytePtrFromString(msg)
+			procMessageBoxA.Call(0, uintptr(unsafe.Pointer(pMsg)), uintptr(unsafe.Pointer(pTitle)), 0)
+
+			info.ContextRecord.Rax = 0
+			info.ContextRecord.Rip += 1
+			return EXCEPTION_CONTINUE_EXECUTION
+
+		case 0x200099A: // Native Win32 GUI Input Box
+			titlePtr := info.ContextRecord.Rdi
+			promptPtr := info.ContextRecord.Rsi
+			bufPtr := info.ContextRecord.Rdx
+			maxLen := info.ContextRecord.Rcx
+
+			title := readCString(uintptr(titlePtr))
+			prompt := readCString(uintptr(promptPtr))
+
+			if Debug {
+				fmt.Printf("[Darwindows GUI] InputBox -> Title: %q, Prompt: %q\n", title, prompt)
+			}
+
+			inputStr := showGUIInputBox(title, prompt)
+
+			if maxLen > 0 {
+				destSlice := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(bufPtr))), maxLen)
+				n := copy(destSlice, []byte(inputStr+"\x00"))
+				info.ContextRecord.Rax = uint64(n - 1)
+			} else {
+				info.ContextRecord.Rax = 0
+			}
+
+			info.ContextRecord.Rip += 1
+			return EXCEPTION_CONTINUE_EXECUTION
+
+		case 0x2000001: // macOS sys_exit
+			exitCode := info.ContextRecord.Rdi
+			if Debug {
+				fmt.Printf("[Darwindows] Intercepted sys_exit (code: %d). Terminating.\n", exitCode)
+			}
+			procExitProcess.Call(uintptr(exitCode))
+			return EXCEPTION_CONTINUE_EXECUTION
+
+		default:
+			if Debug {
+				fmt.Printf("[Darwindows ERROR] Unhandled syscall/trap RAX: 0x%x at RIP: 0x%x\n", rax, rip)
+			}
+		}
 	}
-	return string(bytes)
+
+	return EXCEPTION_CONTINUE_SEARCH
+}
+
+type EXCEPTIONS_POINTERS_ALIAS = struct {
+	ExceptionRecord *EXCEPTION_RECORD
+	ContextRecord   *CONTEXT
 }
 
 func RegisterVEH() {
-	handlerPtr := syscall.NewCallback(func(p uintptr) uintptr {
-		return vehHandler(p)
+	if vehHandle != 0 {
+		return
+	}
+	cb := syscall.NewCallback(func(pInfo *EXCEPTIONS_POINTERS_ALIAS) uintptr {
+		return vehCallback(pInfo)
 	})
-	procAddVectoredHandler.Call(1, handlerPtr)
+
+	ret, _, _ := procAddVectoredExceptionHandler.Call(1, cb)
+	if ret != 0 {
+		vehHandle = ret
+		if Debug {
+			fmt.Println("[Darwindows] Vectored Exception Handler registered successfully.")
+		}
+	}
 }
